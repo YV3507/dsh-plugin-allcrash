@@ -1,0 +1,17 @@
+# dsh-plugin-allcrash bundle patch.
+#
+# 一行**纯 insert**（不带 config）：纯 insert 行可以热挂载，安装后立即生效。
+# 被禁插件列表放在 ${DSH_HOME}/allcrash.json（首次运行自动生成默认值），
+# 对应原型 allcrash 的 config/allcrash-common.toml。
+#
+# 需要写在 YAML 里也可以，但带 config 的行会在启动时重新合成（需要重启）：
+#
+#   - insert:
+#       - id: allcrash
+#         name: 'dsh-plugin-allcrash'
+#         config:
+#           crash_plugin: ['dshmarket']
+
+- insert:
+    - id: allcrash
+      name: 'dsh-plugin-allcrash'

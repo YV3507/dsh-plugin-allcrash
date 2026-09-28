@@ -1,0 +1,27 @@
+name: test
+
+# 只跑离线单测：判定/匹配/路径/配置/报告/引爆器全部不依赖 DSH 安装。
+# 隔离模式（test/run-modes.mjs）需要本机装有 DSH（用 DSH_APP_ROOT 定位 boot()），
+# 所以放到 CI 里只做语法检查 —— 详见 README 的「测试」一节。
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  unit:
+    name: unit (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Offline unit tests
+        run: node test/unit.test.mjs
+      - name: Harness syntax check
+        run: node --check test/isolated-boot.mjs && node --check test/run-modes.mjs

@@ -1,0 +1,4 @@
+{
+  "title": "AllCrash (forbidden plugins)",
+  "description": "Detects a configured forbidden plugin — loaded, enabled, installed, or about to be installed — and crashes the DSH Host process on the spot."
+}

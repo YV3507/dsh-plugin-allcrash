@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="AllCrash">
+  <defs>
+    <linearGradient id="bomb" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5b6472"/>
+      <stop offset="1" stop-color="#1d222b"/>
+    </linearGradient>
+  </defs>
+  <circle cx="28" cy="38" r="17" fill="url(#bomb)"/>
+  <rect x="22" y="16" width="12" height="7" rx="2" fill="#8b94a3"/>
+  <path d="M28 16 C30 10 40 12 44 6" stroke="#c8a24a" stroke-width="3" fill="none" stroke-linecap="round"/>
+  <circle cx="46" cy="5" r="4" fill="#ff6b3d"/>
+  <circle cx="46" cy="5" r="2" fill="#ffd88a"/>
+  <path d="M20 34 l4 4 -4 4 M36 34 l-4 4 4 4" stroke="#ff6b3d" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

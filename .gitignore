@@ -1,0 +1,9 @@
+# 依赖
+node_modules/
+
+# 隔离测试的临时目录（默认落在包目录下）
+.isolated/
+
+# 崩溃报告与审计日志（如果被复制进来）
+crash-reports/
+*.log

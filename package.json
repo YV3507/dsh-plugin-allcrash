@@ -1,0 +1,68 @@
+{
+  "name": "dsh-plugin-allcrash",
+  "version": "1.0.0",
+  "private": true,
+  "description": "DSH Host plugin: a configured forbidden plugin (loaded, enabled, installed, or about to be installed) crashes the Host process immediately and leaves a crash report.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "lib",
+    "locale",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE",
+    "icon.svg"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "test": "node test/unit.test.mjs && node test/run-modes.mjs",
+    "test:unit": "node test/unit.test.mjs",
+    "test:modes": "node test/run-modes.mjs"
+  },
+  "meta": {
+    "title": {
+      "en": "AllCrash (forbidden plugins)",
+      "zh": "AllCrash 禁止插件"
+    },
+    "description": {
+      "en": "Detects a configured forbidden plugin (loaded, enabled, installed, or about to be installed) and crashes the DSH Host process on the spot.",
+      "zh": "检测到配置里禁止的插件（已加载 / 被启用 / 已安装 / 正在安装）时，立刻崩溃 DSH Host 进程。"
+    }
+  },
+  "icon": "./icon.svg",
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis",
+    "plugin",
+    "bundle",
+    "guard",
+    "tripwire",
+    "allcrash"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YV3507/dsh-plugin-allcrash.git"
+  },
+  "bugs": {
+    "url": "https://github.com/YV3507/dsh-plugin-allcrash/issues"
+  },
+  "homepage": "https://github.com/YV3507/dsh-plugin-allcrash#readme",
+  "author": "YV3507",
+  "license": "MIT"
+}

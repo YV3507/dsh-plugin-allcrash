@@ -1,0 +1,4 @@
+{
+  "title": "AllCrash 禁止插件",
+  "description": "检测到配置里禁止的插件（已加载 / 被启用 / 已安装 / 正在安装）时，立刻崩溃 DSH Host 进程。"
+}
