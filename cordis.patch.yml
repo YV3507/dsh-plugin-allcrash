@@ -10,7 +10,8 @@
 #       - id: allcrash
 #         name: 'dsh-plugin-allcrash'
 #         config:
-#           crash_plugin: ['dshmarket']
+#           mode: deny                      # crash（默认）/ deny / warn
+#           crash_plugin: ['dshmarket', 'bad-plugin@<2.0.0']
 
 - insert:
     - id: allcrash

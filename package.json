@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-allcrash",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "description": "DSH Host plugin: a configured forbidden plugin (loaded, enabled, installed, or about to be installed) crashes the Host process immediately and leaves a crash report.",
   "type": "module",

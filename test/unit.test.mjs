@@ -13,16 +13,27 @@ import {
   candidatesOf,
   classifyInstallLog,
   classifyManagerCall,
+  compareVersions,
   formatLocalTime,
   globMatches,
   inspectLoaderRows,
   inspectPresetCompositions,
+  matchPolicy,
   mergeConfig,
+  modeOfConfig,
   nameMatches,
+  normalizePolicy,
   parseConfigText,
+  parseVersionConstraint,
+  policyOf,
   readLoaderRows,
+  resolveResponse,
   rickrollMessage,
+  satisfiesVersion,
   shortName,
+  splitNameVersion,
+  strictestMode,
+  testPolicyEntry,
 } from '../lib/guard.js'
 import { createDetonator, EXIT_FALLBACK_MS, stamp } from '../lib/detonate.js'
 import {
@@ -37,6 +48,7 @@ import {
 } from '../lib/paths.js'
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
+import { existsSync, readFileSync, rmSync } from 'node:fs'
 
 /* ------------------------------------------------------------ 名字归一化 */
 
@@ -308,30 +320,31 @@ test('inspectLoaderRows：按包名或行 id 命中，默认忽略 disabled 行'
   )
   const hit = inspectLoaderRows(rows, { crash_plugin: ['dshmarket', 'dsh-plugin-wallpaper-*'] })
   assert.deepEqual(
-    hit.map((v) => v.moduleName).sort(),
+    hit.violations.map((v) => v.moduleName).sort(),
     ['dsh-plugin-wallpaper-engine', 'dshmarket'],
   )
+  assert.deepEqual(hit.notes, [])
 
   // 按行 id 命中
-  assert.equal(inspectLoaderRows(rows, { crash_plugin: ['ui-chat'] }).length, 1)
+  assert.equal(inspectLoaderRows(rows, { crash_plugin: ['ui-chat'] }).violations.length, 1)
 
   // disabled 行默认不算「已加载」；打开开关才算
-  assert.equal(inspectLoaderRows(rows, { crash_plugin: ['ghost-plugin'] }).length, 0)
-  assert.equal(inspectLoaderRows(rows, { crash_plugin: ['ghost-plugin'], include_disabled: true }).length, 1)
+  assert.equal(inspectLoaderRows(rows, { crash_plugin: ['ghost-plugin'] }).violations.length, 0)
+  assert.equal(inspectLoaderRows(rows, { crash_plugin: ['ghost-plugin'], include_disabled: true }).violations.length, 1)
 
   // 组节点永不命中
-  assert.equal(inspectLoaderRows(rows, { crash_plugin: ['g'] }).length, 0)
+  assert.equal(inspectLoaderRows(rows, { crash_plugin: ['g'] }).violations.length, 0)
 })
 
 test('inspectLoaderRows：行 name 是模块 spec，插件声明名同样能命中', () => {
   // 行 name 是模块 spec（'./dummy-mod.js'），插件自己声明的名字才叫 dummy-forbidden；
   // 两个都要能命中，否则只比对行 name 就会漏检
   const rows = readLoaderRows(fakeLoader([row({ id: 'dummy', name: './dummy-mod.js' }, { pluginName: 'dummy-forbidden' })]))
-  const byDeclared = inspectLoaderRows(rows, { crash_plugin: ['dummy-forbidden'] })
+  const byDeclared = inspectLoaderRows(rows, { crash_plugin: ['dummy-forbidden'] }).violations
   assert.equal(byDeclared.length, 1)
   assert.equal(byDeclared[0].pluginName, 'dummy-forbidden')
   // spec 里的路径片段也照样能命中
-  assert.equal(inspectLoaderRows(rows, { crash_plugin: ['dummy-mod'] }).length, 1)
+  assert.equal(inspectLoaderRows(rows, { crash_plugin: ['dummy-mod'] }).violations.length, 1)
   // 报告里两个名字都要能看见
   const text = buildReport({ violations: byDeclared, rows, config: { crash_plugin: ['dummy-forbidden'] } })
   assert.match(text, /\[plugin name: dummy-forbidden\]/)
@@ -363,9 +376,9 @@ test('inspectPresetCompositions 按真实行形状判定：enabled / fiberState 
 
   const hit = inspectPresetCompositions(compositions, { crash_plugin: ['dshmarket'] })
   // enabled:false 的 preset 行不算「已加载」，与 loader 通道同一语义
-  assert.equal(hit.length, 0)
+  assert.equal(hit.violations.length, 0)
 
-  const withDisabled = inspectPresetCompositions(compositions, { crash_plugin: ['dshmarket'], include_disabled: true })
+  const withDisabled = inspectPresetCompositions(compositions, { crash_plugin: ['dshmarket'], include_disabled: true }).violations
   assert.equal(withDisabled.length, 1)
   assert.equal(withDisabled[0].preset, 'custom')
   assert.equal(withDisabled[0].phase, 'pending')
@@ -373,108 +386,323 @@ test('inspectPresetCompositions 按真实行形状判定：enabled / fiberState 
   assert.equal(withDisabled[0].entryId, '') // entryId 为 null 时不能写出字符串 'null'
 
   // 行 id 与声明名都要能命中
-  assert.equal(inspectPresetCompositions(compositions, { crash_plugin: ['evil-tool'] })[0].phase, 'active')
+  assert.equal(inspectPresetCompositions(compositions, { crash_plugin: ['evil-tool'] }).violations[0].phase, 'active')
 
   // conditional 行按「可能被加载」处理，并把 condition 带进判定结果
-  const conditional = inspectPresetCompositions(compositions, { crash_plugin: ['dsh-whale-widget'] })
+  const conditional = inspectPresetCompositions(compositions, { crash_plugin: ['dsh-whale-widget'] }).violations
   assert.equal(conditional.length, 1)
   assert.equal(conditional[0].enabled, true)
   assert.equal(conditional[0].condition, 'ctx.get("flag")')
   assert.equal(conditional[0].preset, 'standard')
 
-  assert.equal(inspectPresetCompositions(compositions, { crash_plugin: ['nope'] }).length, 0)
+  assert.equal(inspectPresetCompositions(compositions, { crash_plugin: ['nope'] }).violations.length, 0)
+
+  // 预设行拿不到版本：带版本约束的条目在这里只回报 note，不算命中
+  // （要 include_disabled 才轮得到那个 enabled:false 的 dshmarket 行被判定）
+  const versioned = inspectPresetCompositions(compositions, { crash_plugin: ['dshmarket@1.66.0'], include_disabled: true })
+  assert.equal(versioned.violations.length, 0)
+  assert.equal(versioned.notes.length, 1)
+  assert.match(versioned.notes[0], /版本约束未生效/)
 })
 
 /* ------------------------------------------------------- plugin_manager 闸门 */
 
 test('classifyManagerCall：安装尝试在 pnpm 启动前就被判死', () => {
   const config = { crash_plugin: ['dshmarket', 'evil-*'], self_entry_ids: ['allcrash'], self_package: 'dsh-plugin-allcrash' }
-  const hit = classifyManagerCall('plugin_manager', { action: 'install_bundle', target: 'dshmarket@1.66.0' }, config)
+  const hit = classifyManagerCall('plugin_manager', { action: 'install_bundle', target: 'dshmarket@1.66.0' }, config).hit
   assert.equal(hit?.kind, 'install-attempt')
   assert.equal(hit?.pattern, 'dshmarket')
 
-  const wild = classifyManagerCall('plugin_manager', { action: 'install_bundle', target: 'evil-tool' }, config)
+  const wild = classifyManagerCall('plugin_manager', { action: 'install_bundle', target: 'evil-tool' }, config).hit
   assert.equal(wild?.kind, 'install-attempt')
 
   // 本地路径安装：目录名命中即可
-  const local = classifyManagerCall('plugin_manager', { action: 'install_bundle', target: 'E:/vendor/dshmarket' }, config)
+  const local = classifyManagerCall('plugin_manager', { action: 'install_bundle', target: 'E:/vendor/dshmarket' }, config).hit
   assert.equal(local?.kind, 'install-attempt')
 })
 
 test('classifyManagerCall：启用尝试、无关操作与非本工具都不触发', () => {
   const config = { crash_plugin: ['dshmarket'], self_entry_ids: ['allcrash'], self_package: 'dsh-plugin-allcrash' }
-  assert.equal(classifyManagerCall('plugin_manager', { action: 'set_bundle', target: 'dshmarket', enabled: true }, config)?.kind, 'enable-attempt')
+  const hitOf = (args, cfg = config, resolver = {}) => classifyManagerCall('plugin_manager', args, cfg, resolver).hit
+  assert.equal(hitOf({ action: 'set_bundle', target: 'dshmarket', enabled: true })?.kind, 'enable-attempt')
   // 行 id 与包名不同：给 resolver 就能解析回来
-  assert.equal(classifyManagerCall('plugin_manager', { action: 'set_plugin', target: 'bundle-dshmarket', enabled: true }, config), undefined)
-  const resolved = classifyManagerCall(
-    'plugin_manager',
+  assert.equal(hitOf({ action: 'set_plugin', target: 'bundle-dshmarket', enabled: true }), undefined)
+  const resolved = hitOf(
     { action: 'set_plugin', target: 'bundle-dshmarket', enabled: true },
     config,
     { moduleNameOf: (entryId) => (entryId === 'bundle-dshmarket' ? 'dshmarket' : undefined) },
   )
   assert.equal(resolved?.kind, 'enable-attempt')
   // 通配也能直接命中行 id
-  assert.equal(classifyManagerCall('plugin_manager', { action: 'set_plugin', target: 'bundle-dshmarket', enabled: true }, { ...config, crash_plugin: ['*dshmarket*'] })?.kind, 'enable-attempt')
+  assert.equal(hitOf({ action: 'set_plugin', target: 'bundle-dshmarket', enabled: true }, { ...config, crash_plugin: ['*dshmarket*'] })?.kind, 'enable-attempt')
   // 关掉被禁插件是允许的（那是恢复动作）
-  assert.equal(classifyManagerCall('plugin_manager', { action: 'set_bundle', target: 'dshmarket', enabled: false }, config), undefined)
+  assert.equal(hitOf({ action: 'set_bundle', target: 'dshmarket', enabled: false }), undefined)
   // 列表/无关目标
-  assert.equal(classifyManagerCall('plugin_manager', { action: 'list_plugins' }, config), undefined)
-  assert.equal(classifyManagerCall('plugin_manager', { action: 'install_bundle', target: 'harmless-plugin' }, config), undefined)
-  assert.equal(classifyManagerCall('plugin_manager', { action: 'install_bundle' }, config), undefined)
-  assert.equal(classifyManagerCall('read', { action: 'install_bundle', target: 'dshmarket' }, config), undefined)
-  assert.equal(classifyManagerCall('plugin_manager', null, config), undefined)
+  assert.equal(classifyManagerCall('plugin_manager', { action: 'list_plugins' }, config).hit, undefined)
+  assert.equal(hitOf({ action: 'install_bundle', target: 'harmless-plugin' }), undefined)
+  assert.equal(hitOf({ action: 'install_bundle' }), undefined)
+  assert.equal(classifyManagerCall('read', { action: 'install_bundle', target: 'dshmarket' }, config).hit, undefined)
+  assert.equal(classifyManagerCall('plugin_manager', null, config).hit, undefined)
   // 关掉安装拦截
-  assert.equal(classifyManagerCall('plugin_manager', { action: 'install_bundle', target: 'dshmarket' }, { ...config, crash_on_install_attempt: false }), undefined)
+  assert.equal(hitOf({ action: 'install_bundle', target: 'dshmarket' }, { ...config, crash_on_install_attempt: false }), undefined)
 })
 
 test('classifyManagerCall：拆除守卫自身触发 self-removal', () => {
   const config = { crash_plugin: [], self_entry_ids: ['allcrash'], self_package: 'dsh-plugin-allcrash' }
-  assert.equal(classifyManagerCall('plugin_manager', { action: 'set_plugin', target: 'allcrash', enabled: false }, config)?.kind, 'self-removal')
-  assert.equal(classifyManagerCall('plugin_manager', { action: 'set_bundle', target: 'dsh-plugin-allcrash', enabled: false }, config)?.kind, 'self-removal')
-  assert.equal(classifyManagerCall('plugin_manager', { action: 'remove_bundle', target: 'dsh-plugin-allcrash' }, config)?.kind, 'self-removal')
+  const hitOf = (args, cfg = config) => classifyManagerCall('plugin_manager', args, cfg).hit
+  assert.equal(hitOf({ action: 'set_plugin', target: 'allcrash', enabled: false })?.kind, 'self-removal')
+  assert.equal(hitOf({ action: 'set_bundle', target: 'dsh-plugin-allcrash', enabled: false })?.kind, 'self-removal')
+  assert.equal(hitOf({ action: 'remove_bundle', target: 'dsh-plugin-allcrash' })?.kind, 'self-removal')
   // 启用自己不算
-  assert.equal(classifyManagerCall('plugin_manager', { action: 'set_plugin', target: 'allcrash', enabled: true }, config), undefined)
+  assert.equal(hitOf({ action: 'set_plugin', target: 'allcrash', enabled: true }), undefined)
   // 可关闭
-  assert.equal(classifyManagerCall('plugin_manager', { action: 'remove_bundle', target: 'dsh-plugin-allcrash' }, { ...config, guard_self_removal: false }), undefined)
+  assert.equal(hitOf({ action: 'remove_bundle', target: 'dsh-plugin-allcrash' }, { ...config, guard_self_removal: false }), undefined)
 })
 
 test('classifyManagerCall：给被禁插件开版本豁免也算「放行安装」', () => {
   const config = { crash_plugin: ['dshmarket'], self_entry_ids: ['allcrash'], self_package: 'dsh-plugin-allcrash' }
-  assert.equal(classifyManagerCall('plugin_manager', { action: 'set_version_exemption', target: 'dshmarket@1.66.0', runtimeVersion: '0.1.7', enabled: true }, config)?.kind, 'enable-attempt')
+  const hitOf = (args, cfg = config) => classifyManagerCall('plugin_manager', args, cfg).hit
+  assert.equal(hitOf({ action: 'set_version_exemption', target: 'dshmarket@1.66.0', runtimeVersion: '0.1.7', enabled: true })?.kind, 'enable-attempt')
   // 撤销豁免是恢复动作，放行
-  assert.equal(classifyManagerCall('plugin_manager', { action: 'set_version_exemption', target: 'dshmarket@1.66.0', runtimeVersion: '0.1.7', enabled: false }, config), undefined)
-  assert.equal(classifyManagerCall('plugin_manager', { action: 'set_version_exemption', target: 'harmless@1.0.0', enabled: true }, config), undefined)
+  assert.equal(hitOf({ action: 'set_version_exemption', target: 'dshmarket@1.66.0', runtimeVersion: '0.1.7', enabled: false }), undefined)
+  assert.equal(hitOf({ action: 'set_version_exemption', target: 'harmless@1.0.0', enabled: true }), undefined)
 })
 
 /* ------------------------------------------------------------ 安装日志通道 */
 
 test('classifyInstallLog 只在显式开启时工作，并按整词匹配', () => {
   const chunk = { requestId: 'r1', stream: 'stdout', text: 'Progress: resolved 1, fetched 1\n+ dshmarket 1.66.0' }
-  assert.equal(classifyInstallLog(chunk, { crash_plugin: ['dshmarket'] }), undefined)
-  const hit = classifyInstallLog(chunk, { crash_plugin: ['dshmarket'], crash_on_install_log: true })
+  assert.equal(classifyInstallLog(chunk, { crash_plugin: ['dshmarket'] }).hit, undefined)
+  const hit = classifyInstallLog(chunk, { crash_plugin: ['dshmarket'], crash_on_install_log: true }).hit
   assert.equal(hit?.kind, 'install-log')
   assert.equal(hit?.pattern, 'dshmarket')
   // 不得误伤更长的名字
-  assert.equal(classifyInstallLog({ text: 'dshmarketplace' }, { crash_plugin: ['dshmarket'], crash_on_install_log: true }), undefined)
+  assert.equal(classifyInstallLog({ text: 'dshmarketplace' }, { crash_plugin: ['dshmarket'], crash_on_install_log: true }).hit, undefined)
   // 任意嵌套结构里的字符串都能被抓到
-  assert.equal(classifyInstallLog({ a: { b: ['x', 'evil-tool installed'] } }, { crash_plugin: ['evil-tool'], crash_on_install_log: true })?.pattern, 'evil-tool')
+  assert.equal(classifyInstallLog({ a: { b: ['x', 'evil-tool installed'] } }, { crash_plugin: ['evil-tool'], crash_on_install_log: true }).hit?.pattern, 'evil-tool')
 })
 
 test('classifyInstallLog 支持通配模式（名字被截断一半也能命中）', () => {
   const on = (crash_plugin) => ({ crash_plugin, crash_on_install_log: true })
   const line = { text: '+ dsh-plugin-wallpaper-engine 1.0.0' }
-  assert.equal(classifyInstallLog(line, on(['dsh-plugin-wallpaper-*']))?.pattern, 'dsh-plugin-wallpaper-*')
-  assert.equal(classifyInstallLog({ text: 'dsh-plugin-wallpaper-engine' }, on(['*wallpaper*']))?.pattern, '*wallpaper*')
-  assert.equal(classifyInstallLog(line, on(['dsh-plugin-*-engine']))?.pattern, 'dsh-plugin-*-engine')
+  assert.equal(classifyInstallLog(line, on(['dsh-plugin-wallpaper-*'])).hit?.pattern, 'dsh-plugin-wallpaper-*')
+  assert.equal(classifyInstallLog({ text: 'dsh-plugin-wallpaper-engine' }, on(['*wallpaper*'])).hit?.pattern, '*wallpaper*')
+  assert.equal(classifyInstallLog(line, on(['dsh-plugin-*-engine'])).hit?.pattern, 'dsh-plugin-*-engine')
   // 纯通配定位不到具体包 → 跳过（否则任何一行 pnpm 输出都会崩）
-  assert.equal(classifyInstallLog(line, on(['*'])), undefined)
-  assert.equal(classifyInstallLog(line, on(['?'])), undefined)
+  assert.equal(classifyInstallLog(line, on(['*'])).hit, undefined)
+  assert.equal(classifyInstallLog(line, on(['?'])).hit, undefined)
   // 通配也不能跨出名字边界乱吃
-  assert.equal(classifyInstallLog({ text: 'nothing-here' }, on(['wallpaper*'])), undefined)
+  assert.equal(classifyInstallLog({ text: 'nothing-here' }, on(['wallpaper*'])).hit, undefined)
+  // 日志行里看不到版本：带版本约束的条目只回报 note
+  const versioned = classifyInstallLog(line, on(['dsh-plugin-wallpaper-engine@1.0.0']))
+  assert.equal(versioned.hit, undefined)
+  assert.equal(versioned.notes.length, 1)
+})
+
+/* ------------------------------------------------------------ 版本约束机制 */
+
+test('compareVersions：数字段与预发布段的排序', () => {
+  assert.equal(compareVersions('1.2.3', '1.2.3'), 0)
+  assert.equal(compareVersions('1.2.3', '1.2.4'), -1)
+  assert.equal(compareVersions('1.10.0', '1.9.0'), 1)
+  assert.equal(compareVersions('1.2', '1.2.0'), 0)
+  assert.equal(compareVersions('v1.2.3', '1.2.3'), 0)
+  // 预发布排在正式版之前
+  assert.equal(compareVersions('1.0.0-rc.1', '1.0.0'), -1)
+  assert.equal(compareVersions('1.0.0-rc.1', '1.0.0-rc.2'), -1)
+  assert.equal(compareVersions('1.0.0-alpha', '1.0.0-beta'), -1)
+  assert.equal(compareVersions('1.0.0-1', '1.0.0-alpha'), -1) // 数字标识符 < 字母标识符
+  // 解析不了 → null（调用方必须按「不可判定」处理）
+  assert.equal(compareVersions('not-a-version', '1.0.0'), null)
+  assert.equal(compareVersions('1.0.0', ''), null)
+})
+
+test('parseVersionConstraint：精确、比较符、^ ~、部分版本、组合', () => {
+  assert.deepEqual(parseVersionConstraint('1.2.3'), { ok: true, clauses: [{ op: '=', version: '1.2.3' }] })
+  assert.deepEqual(parseVersionConstraint('>=1.2.3'), { ok: true, clauses: [{ op: '>=', version: '1.2.3' }] })
+  assert.deepEqual(parseVersionConstraint('^1.2.3'), {
+    ok: true,
+    clauses: [
+      { op: '>=', version: '1.2.3' },
+      { op: '<', version: '2.0.0' },
+    ],
+  })
+  assert.deepEqual(parseVersionConstraint('~1.2.3'), {
+    ok: true,
+    clauses: [
+      { op: '>=', version: '1.2.3' },
+      { op: '<', version: '1.3.0' },
+    ],
+  })
+  // ^0.x 的上界规则
+  assert.equal(parseVersionConstraint('^0.2.3').clauses[1].version, '0.3.0')
+  assert.equal(parseVersionConstraint('^0.0.3').clauses[1].version, '0.0.4')
+  // 部分版本按 x-range
+  assert.deepEqual(parseVersionConstraint('1.2').clauses, [
+    { op: '>=', version: '1.2.0' },
+    { op: '<', version: '1.3.0' },
+  ])
+  assert.deepEqual(parseVersionConstraint('1').clauses, [
+    { op: '>=', version: '1.0.0' },
+    { op: '<', version: '2.0.0' },
+  ])
+  // 组合（空格或逗号）
+  assert.equal(parseVersionConstraint('>=1.0.0 <2.0.0').clauses.length, 2)
+  assert.equal(parseVersionConstraint('>=1.0.0,<2.0.0').clauses.length, 2)
+  // 任意版本
+  assert.deepEqual(parseVersionConstraint('*'), { ok: true, clauses: [] })
+  // 解析不了的要明确失败，不能当成通配
+  assert.equal(parseVersionConstraint('latest-ish!').ok, false)
+  assert.equal(parseVersionConstraint('').ok, false)
+})
+
+test('satisfiesVersion：命中/不命中/不可判定三态', () => {
+  assert.deepEqual(satisfiesVersion('1.66.0', '1.66.0'), { determined: true, satisfied: true })
+  assert.deepEqual(satisfiesVersion('1.70.0', '1.66.0'), { determined: true, satisfied: false })
+  assert.deepEqual(satisfiesVersion('1.70.0', '<2.0.0'), { determined: true, satisfied: true })
+  assert.deepEqual(satisfiesVersion('2.0.0', '<2.0.0'), { determined: true, satisfied: false })
+  assert.deepEqual(satisfiesVersion('1.70.0', '>=1.70.0 <1.72.0'), { determined: true, satisfied: true })
+  assert.deepEqual(satisfiesVersion('1.73.0', '>=1.70.0 <1.72.0'), { determined: true, satisfied: false })
+  assert.equal(satisfiesVersion('1.70.0', '不是版本').determined, false)
+  assert.equal(satisfiesVersion('', '1.70.0').determined, false)
+})
+
+test('splitNameVersion：只看最后一个 @（scope 不能被当成版本分隔符）', () => {
+  assert.deepEqual(splitNameVersion('dshmarket@1.66.0'), { name: 'dshmarket', version: '1.66.0' })
+  assert.deepEqual(splitNameVersion('bad-plugin@<2.0.0'), { name: 'bad-plugin', version: '<2.0.0' })
+  // scope 名不能拆
+  assert.deepEqual(splitNameVersion('@deepseek-ai/dsh-client-ui-chat'), { name: '@deepseek-ai/dsh-client-ui-chat', version: null })
+  assert.deepEqual(splitNameVersion('@scope/pkg@^1.2.0'), { name: '@scope/pkg', version: '^1.2.0' })
+  assert.deepEqual(splitNameVersion('link:E:/vendor/evil'), { name: 'link:E:/vendor/evil', version: null })
+  assert.deepEqual(splitNameVersion('dshmarket'), { name: 'dshmarket', version: null })
+  // 尾段不是版本 → 整串当名字，并回报
+  const weird = splitNameVersion('foo@bar')
+  assert.equal(weird.name, 'foo@bar')
+  assert.equal(weird.version, null)
+  assert.equal(weird.invalidVersion, 'bar')
+})
+
+/* ---------------------------------------------------------------- 策略条目 */
+
+test('normalizePolicy：字符串与对象两种写法，逐条覆盖 mode', () => {
+  const { entries, problems } = normalizePolicy(
+    ['evil-plugin', 'dshmarket@1.66.0', { name: 'bad-plugin', version: '>=2.0.0', mode: 'deny', reason: '会改数据格式' }],
+    'warn',
+  )
+  assert.deepEqual(problems, [])
+  assert.equal(entries.length, 3)
+  assert.deepEqual(
+    entries.map((entry) => [entry.name, entry.version, entry.mode]),
+    [
+      ['evil-plugin', null, 'warn'],
+      ['dshmarket', '1.66.0', 'warn'],
+      ['bad-plugin', '>=2.0.0', 'deny'],
+    ],
+  )
+  assert.equal(entries[2].reason, '会改数据格式')
+})
+
+test('normalizePolicy：坏输入只进 problems，不会静默改变语义', () => {
+  const bad = normalizePolicy([42, null, '', { version: '1.0.0' }, { name: 'ok', version: '不是版本', mode: 'nuke' }], 'crash')
+  assert.deepEqual(bad.entries.map((entry) => entry.name), ['ok'])
+  // 版本解析不了 → 退化成只看名字（并告警）；mode 非法 → 回落全局
+  assert.equal(bad.entries[0].version, null)
+  assert.equal(bad.entries[0].mode, 'crash')
+  assert.ok(bad.problems.some((problem) => /version/.test(problem)))
+  assert.ok(bad.problems.some((problem) => /mode/.test(problem)))
+  assert.ok(bad.problems.some((problem) => /缺少 name/.test(problem)))
+
+  // 非数组：沿用上层（这里返回空条目 + 告警），而不是当成"什么都不禁"
+  const notArray = normalizePolicy('dshmarket', 'crash')
+  assert.deepEqual(notArray.entries, [])
+  assert.match(notArray.problems[0], /不是数组/)
+})
+
+test('testPolicyEntry / matchPolicy：版本约束命中、不命中、不可判定三种结果', () => {
+  const entries = policyOf({ crash_plugin: ['dshmarket@1.66.0'] })
+  assert.equal(entries[0].version, '1.66.0')
+
+  // 名字命中 + 版本满足 → hit
+  assert.equal(testPolicyEntry({ names: ['dshmarket'], version: '1.66.0' }, entries[0]).outcome, 'hit')
+  // 名字命中 + 版本不满足 → mismatch（不拦，这是正确行为）
+  assert.equal(testPolicyEntry({ names: ['dshmarket'], version: '1.70.0' }, entries[0]).outcome, 'version-mismatch')
+  // 版本未知 → 不命中，但要说出来
+  assert.equal(testPolicyEntry({ names: ['dshmarket'], version: null }, entries[0]).outcome, 'version-unknown')
+  // 名字不命中
+  assert.equal(testPolicyEntry({ names: ['other'], version: '1.66.0' }, entries[0]).outcome, 'no-name')
+
+  const unknown = matchPolicy({ names: ['dshmarket'], version: null }, entries)
+  assert.equal(unknown.hit, undefined)
+  assert.equal(unknown.notes.length, 1)
+  assert.match(unknown.notes[0], /版本约束未生效/)
+
+  const mismatched = matchPolicy({ names: ['dshmarket'], version: '1.70.0' }, entries)
+  assert.equal(mismatched.hit, undefined)
+  assert.match(mismatched.notes[0], /不满足/)
+
+  const satisfied = matchPolicy({ names: ['dshmarket'], version: '1.66.0' }, entries)
+  assert.equal(satisfied.hit?.raw, 'dshmarket@1.66.0')
+
+  // 只看名字的条目永远不看版本
+  const plain = policyOf({ crash_plugin: ['dshmarket'] })
+  assert.equal(matchPolicy({ names: ['dshmarket'], version: null }, plain).hit?.name, 'dshmarket')
+})
+
+test('inspectLoaderRows：带版本约束的条目按已装版本判定', () => {
+  const base = row({ id: 'bundle-dshmarket', name: 'dshmarket' })
+  // 契约：readLoaderRows 只负责摊平行，version 由调用方（plugin.js）解析后附加
+  const withVersion = (version) => readLoaderRows(fakeLoader([base])).map((item) => ({ ...item, version }))
+  const config = { crash_plugin: ['dshmarket@1.66.0'] }
+
+  assert.equal(inspectLoaderRows(withVersion('1.66.0'), config).violations.length, 1)
+  const satisfied = inspectLoaderRows(withVersion('1.66.0'), config).violations[0]
+  assert.equal(satisfied.version, '1.66.0')
+  assert.equal(satisfied.entry.version, '1.66.0')
+  assert.equal(satisfied.entry.mode, 'crash')
+
+  assert.equal(inspectLoaderRows(withVersion('1.70.0'), config).violations.length, 0)
+  assert.match(inspectLoaderRows(withVersion('1.70.0'), config).notes[0], /不满足/)
+
+  // 版本读不到：不命中，但 note 里说清楚
+  const unknown = inspectLoaderRows(withVersion(undefined), config)
+  assert.equal(unknown.violations.length, 0)
+  assert.match(unknown.notes[0], /未解析到已安装版本/)
+
+  // 通配 + 版本组合（注意 `dsh-*` 匹配不到 `dshmarket`：glob 是整串锚定的）
+  const globbed = inspectLoaderRows(withVersion('1.99.0'), { crash_plugin: ['dsh*@>=1.90.0'] })
+  assert.equal(globbed.violations.length, 1)
+  assert.equal(inspectLoaderRows(withVersion('1.10.0'), { crash_plugin: ['dsh*@>=1.90.0'] }).violations.length, 0)
+})
+
+test('resolveResponse：全局模式、逐条更严格者优先、deny 在无可拦动作时退化为 warn', () => {
+  assert.equal(modeOfConfig({}), 'crash') // 默认
+  assert.equal(modeOfConfig({ mode: 'nonsense' }), 'crash') // 非法回落默认
+  assert.equal(strictestMode('warn', 'crash'), 'crash')
+  assert.equal(strictestMode('deny', 'warn'), 'deny')
+  assert.equal(strictestMode(undefined, 'warn'), 'warn')
+
+  assert.equal(resolveResponse([], { mode: 'warn' }), 'warn')
+  assert.equal(resolveResponse([], { mode: 'deny' }, { actionable: true }), 'deny')
+  // 没有可拦的动作（插件已经加载）→ deny 无处可施，退化为 warn
+  assert.equal(resolveResponse([], { mode: 'deny' }), 'warn')
+  // 条目比全局更严格时取条目
+  assert.equal(resolveResponse([{ mode: 'crash' }], { mode: 'warn' }), 'crash')
+  assert.equal(resolveResponse([{ mode: 'warn' }], { mode: 'crash' }), 'crash')
+})
+
+test('mergeConfig：mode 字段校验 + policy 归一化', () => {
+  const good = mergeConfig(undefined, { mode: 'warn', crash_plugin: ['a', 'b@1.0.0'] })
+  assert.equal(good.mode, 'warn')
+  assert.deepEqual(good.policy.map((entry) => [entry.name, entry.version, entry.mode]), [
+    ['a', null, 'warn'],
+    ['b', '1.0.0', 'warn'],
+  ])
+  const badMode = mergeConfig(undefined, { mode: 'explode' })
+  assert.equal(badMode.mode, DEFAULT_CONFIG.mode)
+  assert.ok(badMode.problems.some((problem) => /mode/.test(problem)))
 })
 
 /* ------------------------------------------------------------------ 配置合并 */
-
 test('mergeConfig：默认 ← 文件 ← 行配置，逐键覆盖且做类型过滤', () => {
   const cfg = mergeConfig(
     { crash_plugin: ['from-row'], watch_interval_ms: 100 },
@@ -489,7 +717,11 @@ test('mergeConfig：默认 ← 文件 ← 行配置，逐键覆盖且做类型�
   const empty = mergeConfig(undefined, undefined)
   assert.deepEqual(empty.crash_plugin, [...DEFAULT_CONFIG.crash_plugin])
   const junk = mergeConfig({ crash_plugin: [1, null, 'ok', '  '], watch_interval_ms: 'x' }, undefined)
-  assert.deepEqual(junk.crash_plugin, ['ok'])
+  // 原始数组照原样保留（崩溃报告要能看见用户到底写了什么），无效元素只进 problems
+  assert.deepEqual(junk.crash_plugin, [1, null, 'ok', '  '])
+  assert.deepEqual(junk.policy.map((entry) => entry.name), ['ok'])
+  assert.ok(junk.problems.some((problem) => /crash_plugin\[0\]/.test(problem)))
+  assert.ok(junk.problems.some((problem) => /crash_plugin\[3\]/.test(problem)))
 })
 
 test('mergeConfig：类型错误不得把守卫悄悄关掉', () => {
@@ -619,6 +851,29 @@ const incident = {
   stderrMessage: rickrollMessage(DEFAULT_CONFIG, 'dshmarket'),
   description: '试图安装 dshmarket',
 }
+
+test('detonate.note：dry-run 诊断落到 .allcrash/would-crash-*.txt，且不会上膛', () => {
+  const home = join(tmpdir(), 'allcrash-note-home')
+  const detonator = createDetonator({
+    now: () => new Date(2026, 7, 28, 3, 7, 12, 0),
+    pid: () => 4242,
+    env: () => ({ DSH_HOME: home }),
+    stderr: () => {},
+  })
+  const path = detonator.note(incident, buildReport)
+  assert.ok(path, 'note() 应当返回诊断文件路径')
+  assert.match(path, /\.allcrash[\\/]would-crash-\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}-\d{3}-4242\.txt$/)
+  assert.ok(existsSync(path))
+  assert.match(readFileSync(path, 'utf8'), /---- DSH Crash Report ----/)
+  // dry-run 绝不能把引爆器上膛（否则后续命中会被 alreadyFired 吞掉）
+  assert.equal(detonator.fired, false)
+  // 正文生成失败也要落一份（诊断可以退化，不能丢）
+  const broken = detonator.note(incident, () => {
+    throw new Error('build 崩了')
+  })
+  assert.ok(broken && readFileSync(broken, 'utf8').includes('报告生成失败'))
+  rmSync(join(home, '.allcrash'), { recursive: true, force: true })
+})
 
 test('detonate：写报告 + stderr + 异步抛出 + 兜底退出，且只崩一次', () => {
   const { calls, io } = fakeIo()

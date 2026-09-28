@@ -30,6 +30,13 @@ const CASES = [
   { mode: 'gate-after-watchdog', exit: 1, trigger: 'watchdog', name: 'dummy-forbidden' },
   { mode: 'late-mount', exit: 1, trigger: 'plugin-manager/changed', name: 'late-plugin' },
   { mode: 'crash-report-unwritable', exit: 1, noReport: true, stderrIncludes: 'crash report write failed / 崩溃报告写入失败' },
+  // mode=warn：命中但不崩，落 dry-run 诊断 + 审计
+  { mode: 'warn-loaded', exit: 0, alive: true, dryRun: { trigger: 'boot+0ms', auditIncludes: 'would-crash' } },
+  // mode=deny：可拦动作被 deny，Host 存活（harness 自己断言 deny，否则 exit 6）
+  { mode: 'deny-install', exit: 0, alive: true, auditIncludes: 'DENY' },
+  // 版本约束：满足则崩，报告里要能看到已装版本与约束
+  { mode: 'version-hit', exit: 1, trigger: 'boot+0ms', name: 'fake-plugin', reportIncludes: ['installed version: 1.0.0', 'version constraint: <2.0.0'] },
+  { mode: 'version-miss', exit: 0, alive: true },
 ]
 
 const root = join(tmpdir(), 'allcrash-run-modes')
@@ -100,8 +107,41 @@ for (const testCase of CASES) {
     if (testCase.name && !text.includes(testCase.name)) {
       problems.push(`报告里没有出现命中的名字 ${testCase.name}`)
     }
+    for (const needle of testCase.reportIncludes ?? []) {
+      if (!text.includes(needle)) problems.push(`报告里缺少：${needle}`)
+    }
     if (!text.includes('---- DSH Crash Report ----')) problems.push('报告缺少头部')
     if (!text.includes('Recovery')) problems.push('报告缺少 Recovery 段')
+  }
+
+  // mode=warn：不该有崩溃报告，但必须有一份 dry-run 诊断，且审计里能查到
+  if (testCase.dryRun) {
+    const auditDir = join(home, '.allcrash')
+    let diagnostics = []
+    try {
+      diagnostics = existsSync(auditDir) && statSync(auditDir).isDirectory()
+        ? readdirSync(auditDir).filter((file) => file.startsWith('would-crash-') && file.endsWith('.txt'))
+        : []
+    } catch {
+      diagnostics = []
+    }
+    if (diagnostics.length !== 1) {
+      problems.push(`dry-run 诊断数量 ${diagnostics.length} != 1（mode=warn 应当落一份诊断）`)
+    } else {
+      const text = readFileSync(join(auditDir, diagnostics[0]), 'utf8')
+      if (testCase.dryRun.trigger && !text.includes(`trigger=${testCase.dryRun.trigger}`)) {
+        problems.push(`诊断里的 trigger 不是 ${testCase.dryRun.trigger}`)
+      }
+      if (!text.includes('mode=warn')) problems.push('诊断里没有记下 mode=warn')
+    }
+  }
+
+  // 审计日志内容断言（deny / would-crash 这些路径的痕迹）
+  if (testCase.auditIncludes || (testCase.dryRun && testCase.dryRun.auditIncludes)) {
+    const auditPath = join(home, '.allcrash', 'watch.log')
+    const text = existsSync(auditPath) ? readFileSync(auditPath, 'utf8') : ''
+    const needle = testCase.auditIncludes ?? testCase.dryRun.auditIncludes
+    if (!text.includes(needle)) problems.push(`审计日志里缺少：${needle}`)
   }
 
   if (testCase.defaultConfig) {

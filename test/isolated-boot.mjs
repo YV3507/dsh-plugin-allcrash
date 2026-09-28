@@ -20,6 +20,10 @@
 //   gate-after-watchdog 运行期改配置、不发任何事件也不调工具 → 看门狗自己扫到（必须崩）
 //   late-mount  boot 之后才把被禁插件挂进树 + 发 plugin-manager/changed → 必须崩（L2 事件通道）
 //   crash-report-unwritable  报告目录被同名文件占位 → 写不出报告也必须崩
+//   warn-loaded mode=warn，被禁插件已加载 → 只告警 + 落 dry-run 诊断，必须活着
+//   deny-install mode=deny，安装被禁插件 / 拆守卫自身 → waterfall 返回 deny，Host 必须活着
+//   version-hit  被禁插件的已装版本满足约束 → 必须崩（报告里带已装版本与约束）
+//   version-miss 已装版本不满足约束 → 不该命中，必须活着
 import { appendFileSync, existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -129,6 +133,17 @@ writeFileSync(
   'utf8',
 )
 
+// 版本判定用：带 package.json 的插件目录（版本解析要从模块文件往上找到它）
+const fakeDir = join(scratch, 'fake-plugin')
+mkdirSync(fakeDir, { recursive: true })
+writeFileSync(join(fakeDir, 'package.json'), JSON.stringify({ name: 'fake-plugin', version: '1.0.0', type: 'module' }, null, 2), 'utf8')
+const fakeEntryPath = join(fakeDir, 'index.js')
+writeFileSync(
+  fakeEntryPath,
+  ["export const name = 'fake-plugin'", 'export const inject = []', 'export function apply() {}', 'export default { name, inject, apply }', ''].join('\n'),
+  'utf8',
+)
+
 // 相对 cordis.yml 所在目录解析还是绝对 file:// URL：两个入口都用 file:// URL，
 // 这样临时目录可以在包外（$ALLCRASH_TEST_DIR），插件装在只读位置时也能跑。
 // 注意：入口不能写成 Windows 绝对路径 —— 用裸 Include 时 loader 会把 `E:\x` 当作
@@ -145,10 +160,20 @@ const rowConfig =
         : mode === 'late-mount'
           ? // 名单里先放 late-plugin（boot 时树里还没有它），再看事件驱动的重扫能不能抓到
             { crash_plugin: ['late-plugin'], watch_interval_ms: 60000 }
-          : mode === 'gate-after-edit'
-            ? // 行配置里**不能**带 crash_plugin，否则行配置会盖住配置文件，改文件就测不出来了
-              { watch_interval_ms: 60000 }
-            : undefined // crash-file / genfile / gate-after-delete / gate-after-watchdog：走配置文件
+          : mode === 'warn-loaded'
+            ? // dry-run：命中也不崩，只告警 + 落诊断
+              { mode: 'warn', crash_plugin: ['dummy-forbidden'], watch_interval_ms: 1000, audit_log: true }
+            : mode === 'deny-install'
+              ? // 可拦动作走 deny：拒绝安装 / 拆守卫，Host 保持存活
+                { mode: 'deny', crash_plugin: ['dshmarket'], watch_interval_ms: 60000 }
+              : mode === 'version-hit'
+                ? { crash_plugin: ['fake-plugin@<2.0.0'], watch_interval_ms: 1000 }
+                : mode === 'version-miss'
+                  ? { crash_plugin: ['fake-plugin@>=2.0.0'], watch_interval_ms: 1000 }
+                  : mode === 'gate-after-edit'
+                    ? // 行配置里**不能**带 crash_plugin，否则行配置会盖住配置文件，改文件就测不出来了
+                      { watch_interval_ms: 60000 }
+                    : undefined // crash-file / genfile / gate-after-delete / gate-after-watchdog：走配置文件
 
 if (mode === 'crash-file') {
   writeFileSync(configFile, JSON.stringify({ crash_plugin: ['dummy-forbidden'], watch_interval_ms: 1000 }, null, 2), 'utf8')
@@ -168,6 +193,7 @@ const patches = [
   {
     insert: [
       { id: 'dummy-forbidden', name: pathToFileURL(dummyPath).href },
+      ...(mode === 'version-hit' || mode === 'version-miss' ? [{ id: 'fake-plugin', name: pathToFileURL(fakeEntryPath).href }] : []),
       { id: 'allcrash', name: guardName, ...(rowConfig === undefined ? {} : { config: rowConfig }) },
     ],
   },
@@ -185,7 +211,7 @@ console.log(`[isolated] mode=${mode} boot 完成，进程仍然活着`)
 // 兜底计时器**必须在任何 await 之前**注册：命中路径返回的是永不 settle 的 promise，
 // 一旦出现「闸门挂住但进程没死」的回归，后面的 await 会永远不返回 ——
 // 那时也必须以 exit 3 报告失败，而不是让测试进程静默挂着。
-const EXPECT_ALIVE = mode === 'clean' || mode === 'genfile'
+const EXPECT_ALIVE = mode === 'clean' || mode === 'genfile' || mode === 'warn-loaded' || mode === 'deny-install' || mode === 'version-miss'
 // gate-after-watchdog 必须等过完所有启动扫描（0/250/1000ms）再改配置，
 // 否则会被 boot+Nms 那次扫描抓到，就证明不了看门狗
 const backstopMs = mode === 'gate-after-watchdog' ? 6000 : 3000
@@ -200,11 +226,11 @@ if (mode === 'genfile' && !existsSync(configFile)) {
 }
 
 /** 模拟 agent 调用 plugin_manager：走真实的 tools/pre-execute waterfall */
-async function pluginManagerGate(target) {
+async function pluginManagerGate(target, args) {
   const exec = {
     name: 'plugin_manager',
     callId: 'test',
-    arguments: { action: 'install_bundle', target },
+    arguments: args ?? { action: 'install_bundle', target },
     signal: new AbortController().signal,
   }
   return ctx.waterfall('tools/pre-execute', exec, async () => ({ kind: 'allow' }))
@@ -253,4 +279,27 @@ if (mode === 'clean') {
     console.log('[isolated] 放行失败，判定失败')
     process.exit(4)
   }
+}
+
+if (mode === 'deny-install') {
+  // mode=deny：可拦动作直接拒绝，Host 必须活着
+  const install = await pluginManagerGate('dshmarket@1.66.0')
+  console.log('[isolated] 安装被禁插件 →', JSON.stringify(install))
+  if (install?.kind !== 'deny') {
+    console.error('[isolated] mode=deny 时安装被禁插件应当被 deny，实际：', JSON.stringify(install))
+    process.exit(6)
+  }
+  const selfRemoval = await pluginManagerGate(undefined, { action: 'set_plugin', target: 'allcrash', enabled: false })
+  console.log('[isolated] 关停守卫自身 →', JSON.stringify(selfRemoval))
+  if (selfRemoval?.kind !== 'deny') {
+    console.error('[isolated] mode=deny 时拆守卫自身应当被 deny，实际：', JSON.stringify(selfRemoval))
+    process.exit(6)
+  }
+  // 无关调用仍要放行
+  const allowed = await pluginManagerGate('harmless-plugin')
+  if (allowed?.kind !== 'allow') {
+    console.error('[isolated] deny 模式下无关调用被误拦：', JSON.stringify(allowed))
+    process.exit(4)
+  }
+  console.log('[isolated] deny 模式：拒绝生效且 Host 存活')
 }
